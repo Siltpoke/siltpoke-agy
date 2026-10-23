@@ -15610,7 +15610,7 @@ var init_memory = __esm(() => {
 });
 
 // src/memory/distil-worker.ts
-import { join as join9 } from "path";
+import { join as join10 } from "path";
 
 // src/memory/pending-queue.ts
 init_zod();
@@ -15622,7 +15622,7 @@ var TTL_DAYS = 2;
 var pendingAnchorSchema = exports_external.object({
   file: exports_external.string().min(1),
   line: exports_external.number().int().positive().optional(),
-  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep"]),
+  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep", "rubric"]),
   fingerprint: exports_external.string()
 });
 var pendingCritiqueSchema = exports_external.object({
@@ -15786,13 +15786,220 @@ function parseReflectionOutput(raw) {
   return reflectionOutputSchema.parse(raw);
 }
 
+// src/brain/project-settings-off.ts
+var PROJECT_SETTINGS_OFF = ["--setting-sources", "user"];
+
+// src/brain/claude-argv.ts
+var READ_ONLY_TOOLS = "Read,Grep,Glob";
+function buildClaudeArgv(model, promptArgs, readOnly = false, projectSettingsOff = false) {
+  const argv = [
+    "claude",
+    "-p",
+    "--model",
+    model,
+    ...promptArgs,
+    "--output-format",
+    "json",
+    "--verbose",
+    "--no-session-persistence"
+  ];
+  const withSettings = projectSettingsOff ? [...argv, ...PROJECT_SETTINGS_OFF] : argv;
+  return readOnly ? [...withSettings, "--tools", READ_ONLY_TOOLS, "--strict-mcp-config"] : withSettings;
+}
+
+// src/brain/drain-process.ts
+var DRAIN_GRACE_MS = 2000;
+var KILL_GRACE_MS = 2000;
+function stopProcess(proc, graceMs = KILL_GRACE_MS) {
+  proc.kill();
+  if (proc.exited === undefined)
+    return;
+  let exited = false;
+  proc.exited.then(() => {
+    exited = true;
+  }, () => {
+    exited = true;
+  });
+  const timer = setTimeout(() => {
+    if (exited)
+      return;
+    try {
+      proc.kill("SIGKILL");
+    } catch {}
+  }, graceMs);
+  timer.unref?.();
+}
+function collect(source) {
+  const body = source === undefined || source === null ? null : new Response(source).body;
+  if (body === null)
+    return { done: Promise.resolve(), text: () => "", cancel: () => {} };
+  const reader = body.getReader();
+  const decoder = new TextDecoder;
+  let text = "";
+  const done = (async () => {
+    try {
+      for (;; ) {
+        const { done: end, value } = await reader.read();
+        if (end)
+          break;
+        text += decoder.decode(value, { stream: true });
+      }
+      text += decoder.decode();
+    } catch {}
+  })();
+  return {
+    done,
+    text: () => text,
+    cancel: () => {
+      reader.cancel().catch(() => {});
+    }
+  };
+}
+async function drainProcess(proc, graceMs = DRAIN_GRACE_MS) {
+  const out = collect(proc.stdout);
+  const err = collect(proc.stderr);
+  let exitCode;
+  try {
+    exitCode = await proc.exited;
+  } catch (e) {
+    out.cancel();
+    err.cancel();
+    throw e;
+  }
+  let timer;
+  const finished = await Promise.race([
+    Promise.all([out.done, err.done]).then(() => true),
+    new Promise((resolve2) => {
+      timer = setTimeout(() => resolve2(false), graceMs);
+    })
+  ]);
+  if (timer !== undefined)
+    clearTimeout(timer);
+  if (!finished) {
+    out.cancel();
+    err.cancel();
+  }
+  return { stdout: out.text(), stderr: err.text(), exitCode };
+}
+
+// src/brain/envelope.ts
+class EnvelopeShapeError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = "EnvelopeShapeError";
+  }
+}
+function normalizeStreamEnvelope(parsed) {
+  if (Array.isArray(parsed))
+    return parsed;
+  if (parsed !== null && typeof parsed === "object") {
+    const obj = parsed;
+    if (obj.type === "result")
+      return [obj];
+    const keys = Object.keys(obj).slice(0, 8).join(", ");
+    throw new EnvelopeShapeError(`claude -p stdout was a single JSON object with no result event (type=${JSON.stringify(obj.type ?? null)}, keys: ${keys || "none"})`);
+  }
+  throw new EnvelopeShapeError(`claude -p stdout was ${parsed === null ? "null" : typeof parsed}, not a result event or event array`);
+}
+function findResultEvent(events) {
+  for (let i = events.length - 1;i >= 0; i--) {
+    const ev = events[i];
+    if (ev.type === "result")
+      return ev;
+  }
+  throw new EnvelopeShapeError("claude -p stream contained no result event");
+}
+function extractUsage(resultEvent) {
+  const u = resultEvent.usage ?? {};
+  return {
+    cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
+    cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
+    input_tokens: u.input_tokens ?? 0,
+    output_tokens: u.output_tokens ?? 0,
+    total_cost_usd: resultEvent.total_cost_usd ?? null
+  };
+}
+
+// src/brain/failure-reason.ts
+var MAX_REASON = 500;
+function usableMax(max) {
+  return Number.isFinite(max) && max >= 1 ? Math.floor(max) : MAX_REASON;
+}
+function oneLine(text) {
+  return text.replace(/\s+/g, " ").trim();
+}
+function keepHead(text, max) {
+  return oneLine(text).slice(0, usableMax(max));
+}
+function keepTail(text, max) {
+  return oneLine(text).slice(-usableMax(max));
+}
+function readStream(text, max) {
+  const trimmed = text.trim();
+  if (trimmed.length === 0)
+    return { kind: "unreadable" };
+  let event;
+  try {
+    event = findResultEvent(normalizeStreamEnvelope(JSON.parse(trimmed)));
+  } catch {
+    return { kind: "unreadable" };
+  }
+  if (typeof event.error === "string" && event.error.trim().length > 0) {
+    return { kind: "reason", text: keepHead(event.error, max) };
+  }
+  if (event.is_error === false)
+    return { kind: "completed" };
+  if (typeof event.result === "string" && event.result.trim().length > 0) {
+    return { kind: "reason", text: keepHead(event.result, max) };
+  }
+  return { kind: "completed" };
+}
+function explainBrainFailure(facts, max = MAX_REASON) {
+  if (facts.spawnError !== undefined && facts.spawnError.trim().length > 0) {
+    return keepHead(facts.spawnError, max);
+  }
+  const readings = new Map;
+  for (const [name, stream] of [
+    ["stdout", facts.stdout],
+    ["stderr", facts.stderr]
+  ]) {
+    const reading = readStream(stream, max);
+    readings.set(name, reading);
+    if (reading.kind === "reason")
+      return reading.text;
+  }
+  for (const [name, stream] of [
+    ["stderr", facts.stderr],
+    ["stdout", facts.stdout]
+  ]) {
+    if (readings.get(name)?.kind === "completed")
+      continue;
+    const plain = keepTail(stream, max);
+    if (plain.length > 0)
+      return plain;
+  }
+  if ([...readings.values()].some((r) => r.kind === "completed")) {
+    return `exit ${facts.exitCode ?? "?"} after the model had already answered`;
+  }
+  return `exit ${facts.exitCode ?? "?"}, no output`;
+}
+
 // src/brain/schema.ts
 init_zod();
+var INJECTION_WHERE_CAP = 200;
+var INJECTION_QUOTE_CAP = 300;
+var INJECTION_WHY_CAP = 200;
+var INJECTION_CAP = 5;
 var evidenceItemSchema = exports_external.object({
-  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep"]),
+  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep", "rubric"]),
   file: exports_external.string().min(1),
   line: exports_external.number().int().positive().optional(),
   snippet: exports_external.string().min(10).max(240)
+});
+var injectionSuspectedItemSchema = exports_external.object({
+  where: exports_external.string().min(1).max(INJECTION_WHERE_CAP),
+  quote: exports_external.string().min(1).max(INJECTION_QUOTE_CAP),
+  why: exports_external.string().max(INJECTION_WHY_CAP)
 });
 var moodEnum = exports_external.enum([
   "happy",
@@ -15827,11 +16034,18 @@ var categoryEnum = exports_external.enum([
   "consistency"
 ]);
 var refutationCheckedEnum = exports_external.enum(["yes", "no", "not-possible-from-the-diff"]);
+var modelFindingSchema = exports_external.object({
+  title: exports_external.string().min(1).max(120),
+  body: exports_external.string().min(1).max(600),
+  severity: severityEnum,
+  file: exports_external.string().min(1),
+  quote: exports_external.string().min(10).max(240),
+  claimed_start_line: exports_external.number().int().positive().optional(),
+  claimed_end_line: exports_external.number().int().positive().optional()
+});
 var brainOutputSchema = exports_external.object({
   mood: moodEnum,
   pose: poseEnum,
-  bubble_short: exports_external.string().min(1).max(200),
-  bubble_long: exports_external.string().max(2000),
   critique_for_claude: exports_external.string(),
   severity: severityEnum,
   confidence: confidenceEnum,
@@ -15840,6 +16054,10 @@ var brainOutputSchema = exports_external.object({
     amount: exports_external.number().int().nonnegative()
   })),
   evidence: exports_external.array(evidenceItemSchema).max(5).default([]),
+  findings: exports_external.array(modelFindingSchema).default([]),
+  injection_suspected: exports_external.array(injectionSuspectedItemSchema).max(INJECTION_CAP).optional(),
+  bubble_short: exports_external.string().min(1).max(200),
+  bubble_long: exports_external.string().max(2000),
   reasoning: exports_external.string().max(800).optional(),
   category: categoryEnum.optional(),
   what_would_refute: exports_external.string().max(200).optional(),
@@ -15847,6 +16065,87 @@ var brainOutputSchema = exports_external.object({
   truncated: exports_external.record(exports_external.string(), exports_external.number().int().positive()).optional(),
   repaired: exports_external.array(exports_external.string()).optional()
 });
+
+// src/brain/system-prompt-file.ts
+import { mkdtempSync, rmSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join as join5 } from "path";
+
+// src/brain/nul-safe.ts
+var NUL = "\x00";
+function nulSafe(text) {
+  return text.includes(NUL) ? text.replaceAll(NUL, "\u2400") : text;
+}
+
+// src/brain/system-prompt-file.ts
+var NO_CLEANUP = () => {};
+var CMD_SPECIAL = /[\t\n\r "&()<>^|%]/;
+function cleanTempBases() {
+  const systemRoot = process.env.SystemRoot;
+  return [tmpdir(), ...systemRoot === undefined ? [] : [join5(systemRoot, "Temp")]].filter((base) => !CMD_SPECIAL.test(base));
+}
+function systemPromptArgs(systemPrompt, opts) {
+  const platform = opts.platform ?? process.platform;
+  const prompt = nulSafe(systemPrompt);
+  const inline = ["--system-prompt", prompt];
+  if (platform !== "win32" || !opts.supportsFile) {
+    return { args: inline, cleanup: NO_CLEANUP };
+  }
+  for (const base of cleanTempBases()) {
+    let dir;
+    try {
+      dir = mkdtempSync(join5(base, "siltpoke-sp-"));
+      const path = join5(dir, "system-prompt.txt");
+      writeFileSync(path, prompt, "utf8");
+      const made = dir;
+      return {
+        args: ["--system-prompt-file", path],
+        cleanup: () => {
+          try {
+            rmSync(made, { recursive: true, force: true });
+          } catch {}
+        }
+      };
+    } catch {
+      if (dir !== undefined) {
+        try {
+          rmSync(dir, { recursive: true, force: true });
+        } catch {}
+      }
+    }
+  }
+  console.error("[siltpoke] could not stage the system prompt in a temp file \u2014 no writable temp" + " directory whose path is free of cmd.exe special characters. Falling back to" + " passing it as an argument, which Windows will refuse (defect [26]).");
+  return { args: inline, cleanup: NO_CLEANUP };
+}
+
+// src/brain/tool-calls.ts
+var TARGET_CAP = 2000;
+var obj = (v) => v !== null && typeof v === "object" && !Array.isArray(v) ? v : {};
+var str = (v) => typeof v === "string" ? v : undefined;
+var contentOf = (ev) => {
+  const c = obj(obj(ev).message).content;
+  return Array.isArray(c) ? c : [];
+};
+var cap = (s) => s.length > TARGET_CAP ? `${s.slice(0, TARGET_CAP)}\u2026` : s;
+function claudeTarget(input) {
+  const path = str(input.file_path) ?? str(input.path) ?? str(input.notebook_path);
+  const pattern = str(input.pattern);
+  if (pattern !== undefined)
+    return cap(path ? `${pattern} in ${path}` : pattern);
+  return cap(path ?? str(input.command) ?? JSON.stringify(input));
+}
+function blocksOf(events, eventType, blockType) {
+  return events.filter((ev) => obj(ev).type === eventType).flatMap((ev) => contentOf(ev).map(obj)).filter((b) => b.type === blockType);
+}
+function claudeToolCalls(events) {
+  const failedIds = new Set(blocksOf(events, "user", "tool_result").filter((b) => b.is_error === true).map((b) => str(b.tool_use_id)));
+  return blocksOf(events, "assistant", "tool_use").map((b) => ({
+    tool: str(b.name) ?? "tool",
+    target: claudeTarget(obj(b.input)),
+    failed: str(b.id) !== undefined && failedIds.has(str(b.id))
+  }));
+}
+var CODEX_NON_TOOL_ITEMS = new Set(["agent_message", "reasoning", "todo_list", "error"]);
 
 // src/brain/brain.ts
 class BrainError extends Error {
@@ -15886,47 +16185,32 @@ function extractJsonString(text) {
   const match = text.match(FENCED_JSON);
   return match ? match[1]?.trim() : text.trim();
 }
-function findResultEvent(events) {
-  for (let i = events.length - 1;i >= 0; i--) {
-    const ev = events[i];
-    if (ev.type === "result")
-      return ev;
+function classifierStdout(stdout) {
+  try {
+    const ev = findResultEvent(normalizeStreamEnvelope(JSON.parse(stdout)));
+    return JSON.stringify(ev).slice(-500);
+  } catch {
+    return stdout.slice(-500);
   }
-  throw new BrainError("claude -p stream contained no result event");
-}
-function extractUsage(resultEvent) {
-  const u = resultEvent.usage ?? {};
-  return {
-    cache_creation_input_tokens: u.cache_creation_input_tokens ?? 0,
-    cache_read_input_tokens: u.cache_read_input_tokens ?? 0,
-    input_tokens: u.input_tokens ?? 0,
-    output_tokens: u.output_tokens ?? 0,
-    total_cost_usd: resultEvent.total_cost_usd ?? null
-  };
 }
 async function runBrainCall(opts) {
   const model = opts.model ?? DEFAULT_MODEL;
   const timeoutMs = resolveBrainTimeoutMs(opts.timeoutMs);
   const spawn = opts.spawnFn ?? Bun.spawn;
+  const promptArgs = systemPromptArgs(opts.systemPrompt, {
+    supportsFile: true,
+    platform: opts.platform
+  });
   const proc = (() => {
     try {
-      return spawn([
-        "claude",
-        "-p",
-        "--model",
-        model,
-        "--system-prompt",
-        opts.systemPrompt,
-        "--output-format",
-        "json",
-        "--no-session-persistence"
-      ], {
+      return spawn(buildClaudeArgv(model, promptArgs.args, opts.readOnly === true, opts.projectSettingsOff === true), {
         stdin: "pipe",
         stdout: "pipe",
         stderr: "pipe",
         env: { ...process.env, SILTPOKE_INTERNAL: "1" }
       });
     } catch (err) {
+      promptArgs.cleanup();
       throw new BrainError(`claude -p spawn failed: ${err}`, err, {
         exitCode: null,
         stderr: "",
@@ -15935,47 +16219,51 @@ async function runBrainCall(opts) {
       });
     }
   })();
-  proc.stdin.write(opts.contextBundle);
-  proc.stdin.end();
-  const killTimer = setTimeout(() => {
-    try {
-      proc.kill();
-    } catch {}
-  }, timeoutMs);
   let stdout;
   let stderr;
   let exitCode;
+  let killTimer;
   try {
-    stdout = await new Response(proc.stdout).text();
-    stderr = await new Response(proc.stderr).text();
-    exitCode = await proc.exited;
+    proc.stdin.write(opts.contextBundle);
+    proc.stdin.end();
+    killTimer = setTimeout(() => {
+      try {
+        stopProcess(proc);
+      } catch {}
+    }, timeoutMs);
+    ({ stdout, stderr, exitCode } = await drainProcess(proc));
   } finally {
-    clearTimeout(killTimer);
+    if (killTimer !== undefined)
+      clearTimeout(killTimer);
+    promptArgs.cleanup();
   }
   if (exitCode !== 0) {
-    throw new BrainError(`claude -p exited with code ${exitCode}: ${stderr.slice(0, 500)}`, undefined, {
+    throw new BrainError(`claude -p exited with code ${exitCode}: ${explainBrainFailure({ exitCode, stderr, stdout })}`, undefined, {
       exitCode,
       stderr: stderr.slice(-500),
-      stdout: stdout.slice(-500)
+      stdout: classifierStdout(stdout)
     });
   }
+  let resultEvent;
   let events;
+  let isEventList;
   try {
     const parsed = JSON.parse(stdout);
-    if (!Array.isArray(parsed)) {
-      throw new BrainError("claude -p stdout was not a JSON array");
-    }
-    events = parsed;
+    isEventList = Array.isArray(parsed);
+    events = normalizeStreamEnvelope(parsed);
+    resultEvent = findResultEvent(events);
   } catch (err) {
     if (err instanceof BrainError)
       throw err;
+    if (err instanceof EnvelopeShapeError)
+      throw new BrainError(err.message, err);
     throw new BrainError("claude -p stdout was not valid JSON", err);
   }
-  const resultEvent = findResultEvent(events);
   if (resultEvent.is_error || !resultEvent.result) {
     throw new BrainError(`claude -p reported an error: ${resultEvent.error ?? resultEvent.subtype ?? "no result field"}`);
   }
-  return { resultText: resultEvent.result, usage: extractUsage(resultEvent) };
+  const toolCalls = isEventList ? claudeToolCalls(events) : undefined;
+  return { resultText: resultEvent.result, usage: extractUsage(resultEvent), toolCalls };
 }
 
 // src/brain/reflection.ts
@@ -16063,7 +16351,9 @@ async function callReflection(opts) {
     contextBundle: buildContextBundle(opts),
     model: opts.model ?? DEFAULT_MODEL2,
     timeoutMs: opts.timeoutMs ?? DEFAULT_TIMEOUT_MS2,
-    spawnFn: opts.spawnFn
+    spawnFn: opts.spawnFn,
+    readOnly: true,
+    projectSettingsOff: true
   });
   const innerText = extractJsonString(resultText);
   let inner;
@@ -16117,9 +16407,9 @@ async function writePositiveRule(homeBase, entry, deps = {}) {
 
 // src/memory/adjudication-log.ts
 import { appendFile as appendFile2, mkdir as mkdir5 } from "fs/promises";
-import { dirname as dirname3, join as join5 } from "path";
+import { dirname as dirname3, join as join6 } from "path";
 function adjudicationLogPath(stateBase) {
-  return join5(stateBase, "adjudication.jsonl");
+  return join6(stateBase, "adjudication.jsonl");
 }
 async function appendAdjudication(path, record2) {
   try {
@@ -16132,22 +16422,22 @@ async function appendAdjudication(path, record2) {
 // src/utils/process-lock.ts
 import {
   mkdirSync as mkdirSync2,
-  rmSync,
+  rmSync as rmSync2,
   readFileSync as readFileSync2,
   existsSync as existsSync4,
   utimesSync
 } from "fs";
-import { join as join7 } from "path";
+import { join as join8 } from "path";
 import { hostname as hostname3 } from "os";
 
 // src/utils/atomic-write.ts
-import { writeFileSync, renameSync, mkdirSync } from "fs";
-import { dirname as dirname4, basename as basename2, join as join6 } from "path";
+import { writeFileSync as writeFileSync2, renameSync, mkdirSync } from "fs";
+import { dirname as dirname4, basename as basename2, join as join7 } from "path";
 function atomicWrite(path, data, opts) {
   const dir = dirname4(path);
   mkdirSync(dir, { recursive: true });
-  const tmp = join6(dir, `.tmp-${basename2(path)}-${process.pid}-${Date.now()}`);
-  writeFileSync(tmp, data, opts?.mode !== undefined ? { mode: opts.mode } : undefined);
+  const tmp = join7(dir, `.tmp-${basename2(path)}-${process.pid}-${Date.now()}`);
+  writeFileSync2(tmp, data, opts?.mode !== undefined ? { mode: opts.mode } : undefined);
   renameSync(tmp, path);
 }
 
@@ -16175,7 +16465,7 @@ function acquireLock(lockPath, opts) {
     const code = err.code;
     if (code !== "EEXIST")
       throw err;
-    const ownerPath2 = join7(lockPath, "owner.json");
+    const ownerPath2 = join8(lockPath, "owner.json");
     if (existsSync4(ownerPath2)) {
       try {
         const owner2 = JSON.parse(readFileSync2(ownerPath2, "utf8"));
@@ -16187,10 +16477,10 @@ function acquireLock(lockPath, opts) {
           throw parseErr;
       }
     }
-    rmSync(lockPath, { recursive: true, force: true });
+    rmSync2(lockPath, { recursive: true, force: true });
     mkdirSync2(lockPath, { recursive: false });
   }
-  const ownerPath = join7(lockPath, "owner.json");
+  const ownerPath = join8(lockPath, "owner.json");
   const owner = {
     pid: process.pid,
     startedAt: Date.now(),
@@ -16220,7 +16510,7 @@ function acquireLock(lockPath, opts) {
 function releaseLock(handle) {
   clearInterval(handle.heartbeat);
   try {
-    rmSync(handle.path, { recursive: true, force: true });
+    rmSync2(handle.path, { recursive: true, force: true });
   } catch (err) {
     process.stderr.write(`[process-lock] releaseLock cleanup failed: ${err.message}
 `);
@@ -16579,12 +16869,12 @@ var nodeGcDeps = {
 init_zod();
 import { existsSync as existsSync5 } from "fs";
 import { readFile as readFile6 } from "fs/promises";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 var case1CaptureConfigSchema = exports_external.object({
   capture_case1: exports_external.boolean().default(false)
 });
 async function loadCase1CaptureConfig(home) {
-  const configPath = join8(home, "config.json");
+  const configPath = join9(home, "config.json");
   if (!existsSync5(configPath))
     return case1CaptureConfigSchema.parse({});
   try {
@@ -16693,7 +16983,7 @@ async function sweepEntriesOnce(homeBase, stateBase, cwd, deps = {}) {
   return { written, expired, pending: survivors.length };
 }
 async function runDistilWorker(homeBase, stateBase, cwd, deps = {}) {
-  const lockPath = deps.lockPath ?? join9(homeBase, "distil-worker.lock");
+  const lockPath = deps.lockPath ?? join10(homeBase, "distil-worker.lock");
   let handle;
   try {
     handle = acquireLock(lockPath, { version: LOCK_VERSION, heartbeatMs: HEARTBEAT_MS });

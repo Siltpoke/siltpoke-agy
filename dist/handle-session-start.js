@@ -16,9 +16,10 @@ var __export = (target, all) => {
 
 // src/hooks/handle-session-start.ts
 import { spawnSync } from "child_process";
-import { existsSync as existsSync3, mkdirSync as mkdirSync3, writeFileSync as writeFileSync2 } from "fs";
-import { mkdir as mkdir4, writeFile as writeFile3 } from "fs/promises";
-import { join as join8 } from "path";
+import { existsSync as existsSync8, mkdirSync as mkdirSync4, writeFileSync as writeFileSync3 } from "fs";
+import { mkdir as mkdir5, writeFile as writeFile4 } from "fs/promises";
+import { dirname as dirname7, join as join13 } from "path";
+import { fileURLToPath } from "url";
 
 // src/installer/agy-migration.ts
 import { readFile } from "fs/promises";
@@ -114,14 +115,290 @@ async function removeCcForkLegacyHooks(settingsPath) {
   } catch {}
 }
 
+// src/installer/shim.ts
+import { existsSync, readFileSync, statSync } from "fs";
+import { chmod, mkdir, rename, rm, writeFile } from "fs/promises";
+import { dirname as dirname2, join as join2 } from "path";
+var BUN_RESOLVE_SNIPPET = `# >>> siltpoke bun-resolve (sentinels: tests slice this block out and run it)
+BUN="$(command -v bun 2>/dev/null || true)"
+if [ -z "$BUN" ] && [ -f "\${HOME}/.siltpoke/bun-path" ]; then
+  RECORDED="$(cat "\${HOME}/.siltpoke/bun-path" 2>/dev/null || true)"
+  [ -n "$RECORDED" ] && [ -x "$RECORDED" ] && BUN="$RECORDED"
+fi
+[ -n "$BUN" ] || { [ -x "\${HOME}/.bun/bin/bun" ] && BUN="\${HOME}/.bun/bin/bun"; }
+# <<< siltpoke bun-resolve`;
+function renderStatuslineShim() {
+  return `#!/bin/sh
+set -u
+# Guarded with :- (not bare \${HOME}) \u2014 under set -u a bare reference to an
+# unset HOME is a hard "unbound variable" crash straight to the session's
+# statusline. Same bug class session-start.sh already guards against.
+HOME="\${HOME:-}"
+ROOT_FILE="\${HOME}/.siltpoke/plugin-root"
+INNER_FILE="\${HOME}/.siltpoke/inner.txt"
+# Hand this render to the status line the user had before siltpoke. stdin is
+# left untouched so their command still receives Claude Code's JSON.
+run_inner() {
+  [ -f "$INNER_FILE" ] || exit 0
+  INNER="$(cat "$INNER_FILE" 2>/dev/null || true)"
+  [ -n "$INNER" ] || exit 0
+  # A saved command that is this shim would call itself forever.
+  case "$INNER" in *.siltpoke/bin/statusline.sh*) exit 0 ;; esac
+  # bash first, as the card runs it (src/face/wrapper.ts); sh where there is none.
+  if command -v bash >/dev/null 2>&1; then exec bash -c "$INNER"; fi
+  exec sh -c "$INNER"
+}
+[ -f "$ROOT_FILE" ] || run_inner
+ROOT="$(cat "$ROOT_FILE" 2>/dev/null)" || exit 0
+CARD="\${ROOT}/dist/siltpoke-card.js"
+[ -f "$CARD" ] || run_inner
+${BUN_RESOLVE_SNIPPET}
+# This shim is only ever started from CLAUDE CODE's settings.json, so the only
+# uninstall it may act on is Claude Code's \u2014 and both signals are read from
+# Claude Code's own plugin folder, never from wherever the pointer leads. The
+# pointer is shared (qoder and codebuddy write the same file, with the same
+# cache layout), so following it would let another host's uninstall take the
+# pet out of Claude Code.
+CLAUDE_PLUGINS="\${CLAUDE_HOME:-\${HOME}/.claude}/plugins"
+REGISTRY="\${CLAUDE_PLUGINS}/installed_plugins.json"
+# The orphan mark is looked for on Claude Code's CACHE COPY of the plugin, not
+# at the pointer's root. With a directory marketplace the plugin runs from its
+# source folder (which is what the pointer names) and the mark is still written
+# to the cache copy \u2014 measured 2026-10-02, where looking only at the root left
+# the pet in place after a real uninstall.
+ORPHAN=""
+for MARK in "$CLAUDE_PLUGINS"/cache/*/siltpoke/*/.orphaned_at; do
+  [ -f "$MARK" ] && ORPHAN="$MARK"
+done
+UNINSTALLED=0
+if [ -n "$ORPHAN" ] && [ -f "$REGISTRY" ]; then
+  grep -q '"siltpoke@' "$REGISTRY" 2>/dev/null
+  # Exactly 1 = grep ran and found no siltpoke. Anything else (found, or grep
+  # itself unusable) leaves the pet alone.
+  [ "$?" -eq 1 ] && UNINSTALLED=1
+fi
+if [ "$UNINSTALLED" -eq 1 ]; then
+  # One repair attempt per uninstall, keyed on the orphan stamp \u2014 not one bun
+  # start per render for as long as settings.json is stuck. The stamp is
+  # recorded only once an attempt was actually made: a render that could not
+  # reach bun must not use the attempt up.
+  STAMP="$(cat "$ORPHAN" 2>/dev/null || true)"
+  SEEN_FILE="\${HOME}/.siltpoke/.uninstall-seen"
+  SEEN="$(cat "$SEEN_FILE" 2>/dev/null || true)"
+  CLI="\${ROOT}/dist/siltpoke-cli.js"
+  if [ -n "$BUN" ] && [ -f "$CLI" ]; then
+    if [ ! -f "$SEEN_FILE" ] || [ "$STAMP" != "$SEEN" ]; then
+      { printf '%s' "$STAMP" > "$SEEN_FILE"; } 2>/dev/null || true
+      "$BUN" "$CLI" restore-statusline </dev/null >/dev/null 2>&1 || true
+    fi
+  fi
+  run_inner
+fi
+# Defect [21]: this used to be \`command -v bun \u2026 || exit 0\`, so a user whose bun
+# PATH lives only in ~/.bash_profile got a BLANK statusline with no way to find
+# out why \u2014 the pet simply never appeared. The statusline is the one surface the
+# user looks at every turn, so it is where this gets said out loud (the hook
+# guards stay silent by rule). One short line, no newline of its own.
+[ -n "$BUN" ] || { printf '%s' "siltpoke: can't find bun (not on PATH) \u2014 run /siltpoke:siltpoke-doctor"; exit 0; }
+exec "$BUN" "$CARD" "$@" 2>/dev/null
+`;
+}
+function renderDaemonShim() {
+  return `#!/bin/sh
+set -u
+HOME="\${HOME:-}"
+ROOT_FILE="\${HOME}/.siltpoke/plugin-root"
+DAEMON=""
+if [ -f "$ROOT_FILE" ]; then
+  ROOT="$(cat "$ROOT_FILE" 2>/dev/null || true)"
+  if [ -n "$ROOT" ] && [ -f "\${ROOT}/dist/siltpoke-daemon.js" ]; then
+    DAEMON="\${ROOT}/dist/siltpoke-daemon.js"
+  fi
+fi
+${BUN_RESOLVE_SNIPPET}
+if [ -n "$DAEMON" ] && [ -n "$BUN" ]; then
+  exec "$BUN" "$DAEMON" "$@"
+fi
+# Cannot resolve the daemon right now. Idle rather than exit \u2014 a keep-alive unit
+# would otherwise respawn us every few seconds forever.
+sleep 300
+exit 0
+`;
+}
+function renderUninstallShim() {
+  return `#!/bin/sh
+set -u
+HOME="\${HOME:-}"
+ROOT="$(cat "\${HOME}/.siltpoke/plugin-root" 2>/dev/null || true)"
+CLI="\${ROOT}/dist/siltpoke-cli.js"
+${BUN_RESOLVE_SNIPPET}
+if [ -n "$ROOT" ] && [ -f "$CLI" ]; then
+  if [ -n "$BUN" ]; then
+    exec "$BUN" "$CLI" uninstall "$@"
+  fi
+  # The bundle is here and only bun is missing. That is NOT "the files are
+  # gone": falling through would let --purge delete the data of a plugin that
+  # may still be installed.
+  printf '%s\\n' \\
+    "Siltpoke's uninstall needs bun and cannot find it (not on PATH, not in \${HOME}/.bun)." \\
+    "Nothing was changed. Put bun on PATH and run this again."
+  exit 1
+fi
+# From here on Siltpoke's own code is gone, so no removal plan can be computed
+# and nothing can be asked item by item. Say where the record is, first: a
+# --purge below deletes the folder it is in.
+RECEIPT="\${HOME}/.siltpoke/receipt.json"
+if [ -f "$RECEIPT" ]; then
+  printf '%s\\n' \\
+    "Siltpoke's own files are gone, so this script cannot ask about each thing it installed." \\
+    "What it installed on this machine is recorded in:" \\
+    "  $RECEIPT"
+fi
+CLAUDE_DIR="\${CLAUDE_HOME:-\${HOME}/.claude}"
+SETTINGS="\${CLAUDE_DIR}/settings.json"
+# Matches the Windows form too: in JSON the path is written with doubled backslashes.
+if grep -q 'siltpoke.*bin.*statusline\\.sh' "$SETTINGS" 2>/dev/null; then
+  printf '%s\\n' \\
+    "Siltpoke's own files are gone, so this script cannot edit your settings for you." \\
+    "One thing is left to do by hand:" \\
+    "  1. Open $SETTINGS and find the \\"statusLine\\" block." \\
+    "  2. If you had a status line before Siltpoke, its command is saved in" \\
+    "     \${HOME}/.siltpoke/inner.txt - put it back as the \\"command\\"." \\
+    "     If you had none, delete the whole \\"statusLine\\" block." \\
+    "  3. Run this script again with --purge to delete \${HOME}/.siltpoke."
+  exit 1
+fi
+case " $* " in
+  *" --purge "*)
+    # Same rule as the real uninstall (src/installer/plugin-hosts.ts): no
+    # deleting while ANY host still lists the plugin, because its hooks would
+    # write the folder straight back. The folder is shared by all of them.
+    # Every match is kept, not just the last: the user must see every host
+    # that still has it, and the codex hint below depends on knowing whether
+    # codex was the only one.
+    STILL=""
+    add_still() { if [ -n "$STILL" ]; then STILL="$STILL; $1"; else STILL="$1"; fi; }
+    for REG in \\
+      "\${CLAUDE_DIR}/plugins/installed_plugins.json" \\
+      "\${HOME}/.codebuddy/plugins/installed_plugins.json" \\
+      "\${HOME}/.qoder/plugins/installed_plugins.json" \\
+      "\${HOME}/.qoder/plugins/installed_plugins_v2.json"
+    do
+      if grep -q '"siltpoke@' "$REG" 2>/dev/null; then add_still "$REG"; fi
+    done
+    if [ -d "\${HOME}/.gemini/config/plugins/siltpoke" ]; then add_still "\${HOME}/.gemini/config/plugins/siltpoke"; fi
+    # The plugin's exact NAME key in the JSON list, not a bare "siltpoke": that
+    # also matches a marketplace of that name or a path that happens to contain
+    # it, and such a refusal could never be cleared. The key is matched
+    # ANYWHERE, including the "available" list: telling the two lists apart
+    # needs a JSON parser this script does not have, and a wrong "not
+    # installed" lets rm -rf through. So it blocks too often rather than miss,
+    # and says how to finish by hand when that happens \u2014 but only when codex is
+    # the ONLY host blocking, or the hand delete would hit a folder another
+    # host's hooks write straight back.
+    # A codex that fails or prints nothing is UNKNOWN, not "not installed" \u2014
+    # the same rule as the TS uninstall (plugin-hosts.ts returns null there).
+    CODEX=""
+    CODEX_ONLY=0
+    if command -v codex >/dev/null 2>&1; then
+      if LIST="$(codex plugin list --json 2>/dev/null)" && [ -n "$LIST" ]; then
+        if printf '%s' "$LIST" | tr -d '[:space:]' | grep -q '"name":"siltpoke"'; then
+          CODEX="codex plugin list"
+        fi
+      else
+        CODEX="codex plugin list (could not be read)"
+      fi
+    fi
+    if [ -n "$CODEX" ]; then
+      [ -z "$STILL" ] && CODEX_ONLY=1
+      add_still "$CODEX"
+    fi
+    if [ -n "$STILL" ]; then
+      printf '%s\\n' \\
+        "Siltpoke is still installed in a coding agent, so nothing was deleted." \\
+        "Seen in: $STILL" \\
+        "Uninstall it there (in Claude Code: claude plugin uninstall siltpoke), then run this again." \\
+        "If you installed it for one project only, run that command in the project's folder" \\
+        "and add the scope you installed with: --scope local   or   --scope project"
+      if [ "$CODEX_ONLY" -eq 1 ]; then
+        printf '%s\\n' \\
+          "This script cannot always tell from codex whether Siltpoke is installed there:" \\
+          "it may be listed only as available, or the list could not be read." \\
+          "If 'codex plugin list' shows it is not installed, delete the folder yourself:" \\
+          "  rm -rf \${HOME}/.siltpoke"
+      fi
+      exit 1
+    fi
+    rm -rf "\${HOME}/.siltpoke"
+    printf '%s\\n' "Deleted \${HOME}/.siltpoke. Siltpoke has nothing left in your settings."
+    ;;
+  *)
+    printf '%s\\n' \\
+      "Siltpoke has nothing left in your settings." \\
+      "Your pet, its memory and its review history are still in \${HOME}/.siltpoke." \\
+      "To delete them: sh \${HOME}/.siltpoke/bin/uninstall.sh --purge"
+    ;;
+esac
+`;
+}
+function uninstallShimPath(home) {
+  return join2(home, ".siltpoke", "bin", "uninstall.sh");
+}
+function daemonShimPath(home) {
+  return join2(home, ".siltpoke", "bin", "daemon.sh");
+}
+function statuslineShimPath(home) {
+  return join2(home, ".siltpoke", "bin", "statusline.sh");
+}
+var tmpSeq = 0;
+async function writeExecutable(path, body) {
+  await mkdir(dirname2(path), { recursive: true });
+  const tmpPath = `${path}.tmp-${process.pid}-${Date.now()}-${++tmpSeq}`;
+  try {
+    await writeFile(tmpPath, body, { encoding: "utf8", mode: 493 });
+    await chmod(tmpPath, 493);
+    await rename(tmpPath, path);
+  } catch (err) {
+    await rm(tmpPath, { force: true }).catch(() => {});
+    throw err;
+  }
+  return path;
+}
+async function refreshStaleShims(home) {
+  const rewritten = [];
+  const targets = [
+    [statuslineShimPath(home), renderStatuslineShim()],
+    [daemonShimPath(home), renderDaemonShim()]
+  ];
+  for (const [path, wanted] of targets) {
+    try {
+      if (!existsSync(path))
+        continue;
+      if (readFileSync(path, "utf8") === wanted)
+        continue;
+      await writeExecutable(path, wanted);
+      rewritten.push(path);
+    } catch {}
+  }
+  try {
+    const path = uninstallShimPath(home);
+    const wanted = renderUninstallShim();
+    const current = existsSync(path) ? readFileSync(path, "utf8") : null;
+    if (existsSync(statuslineShimPath(home)) && current !== wanted) {
+      await writeExecutable(path, wanted);
+      rewritten.push(path);
+    }
+  } catch {}
+  return rewritten;
+}
+
 // src/installer/codex-integration.ts
-import { existsSync } from "fs";
-import { mkdir, readFile as readFile3, rename, writeFile } from "fs/promises";
-import { dirname as dirname2, join as join3 } from "path";
+import { mkdir as mkdir2, rename as rename2, writeFile as writeFile2 } from "fs/promises";
+import { dirname as dirname4, join as join6 } from "path";
 import { randomBytes } from "crypto";
 
 // src/installer/paths.ts
-import { join as join2 } from "path";
+import { join as join3, resolve } from "path";
 
 class PathError extends Error {
 }
@@ -135,61 +412,197 @@ function homeDir(env) {
 function siltpokeRoot(env = process.env) {
   const override = env.SILTPOKE_HOME;
   if (typeof override === "string" && override.length > 0) {
-    return override;
+    return resolve(override);
   }
-  return join2(homeDir(env), ".siltpoke");
+  return join3(homeDir(env), ".siltpoke");
 }
 function resolveCodexHome(env = process.env) {
   const override = env.CODEX_HOME;
   if (typeof override === "string" && override.length > 0) {
     return override;
   }
-  return join2(homeDir(env), ".codex");
+  return join3(homeDir(env), ".codex");
 }
 function codexHooksJsonPath(env = process.env) {
-  return join2(resolveCodexHome(env), "hooks.json");
+  return join3(resolveCodexHome(env), "hooks.json");
 }
 function resolveCodebuddyHome(env = process.env) {
   const override = env.CODEBUDDY_HOME;
   if (typeof override === "string" && override.length > 0) {
     return override;
   }
-  return join2(homeDir(env), ".codebuddy");
+  return join3(homeDir(env), ".codebuddy");
 }
 function resolveQoderHome(env = process.env) {
   const override = env.QODER_HOME;
   if (typeof override === "string" && override.length > 0) {
     return override;
   }
-  return join2(homeDir(env), ".qoder");
+  return join3(homeDir(env), ".qoder");
 }
 function resolveAgyHooksJsonPath(env = process.env) {
   const override = env.ANTIGRAVITY_HOOKS_HOME;
   if (typeof override === "string" && override.length > 0) {
-    return join2(override, "hooks.json");
+    return join3(override, "hooks.json");
   }
-  return join2(homeDir(env), ".gemini", "config", "hooks.json");
+  return join3(homeDir(env), ".gemini", "config", "hooks.json");
 }
 function hostSettingsJsonPath(home) {
-  return join2(home, "settings.json");
+  return join3(home, "settings.json");
+}
+
+// src/installer/read-json-object.ts
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "fs";
+function readJsonObjectForRewrite(path) {
+  if (!existsSync2(path))
+    return {};
+  let parsed;
+  try {
+    parsed = JSON.parse(readFileSync2(path, "utf8"));
+  } catch (e) {
+    throw new Error(`${path} is not valid JSON (${e.message}) \u2014 left it untouched. Fix it (or move it aside), then set up again.`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error(`${path} is valid JSON but not an object \u2014 left it untouched. Fix it (or move it aside), then set up again.`);
+  }
+  return parsed;
+}
+
+// src/installer/receipt.ts
+import { existsSync as existsSync4, readFileSync as readFileSync4, renameSync as renameSync2, rmSync } from "fs";
+import { homedir } from "os";
+import { join as join5 } from "path";
+
+// src/installer/created-paths.ts
+var FILE_KINDS = new Set(["host-hook", "statusline"]);
+var PATH_KINDS = new Set(["host-hook", "statusline", "file", "launch-agent"]);
+
+// src/installer/installed-version.ts
+import { existsSync as existsSync3, readFileSync as readFileSync3 } from "fs";
+import { dirname as dirname3, join as join4, parse } from "path";
+function findInstalledVersion(startDir) {
+  let dir = startDir;
+  const root = parse(dir).root;
+  for (;; ) {
+    for (const rel of [join4(".claude-plugin", "plugin.json"), "package.json"]) {
+      const candidate = join4(dir, rel);
+      if (existsSync3(candidate)) {
+        const v = readVersionField(candidate);
+        if (v)
+          return v;
+      }
+    }
+    if (dir === root)
+      return null;
+    const parent = dirname3(dir);
+    if (parent === dir)
+      return null;
+    dir = parent;
+  }
+}
+function readVersionField(path) {
+  try {
+    const parsed = JSON.parse(readFileSync3(path, "utf8"));
+    return typeof parsed.version === "string" && parsed.version.length > 0 ? parsed.version : null;
+  } catch {
+    return null;
+  }
+}
+function isNewerVersion(candidate, current) {
+  const a = parseSemver(candidate);
+  const b = parseSemver(current);
+  if (!a || !b)
+    return false;
+  for (let i = 0;i < 3; i++) {
+    if (a.nums[i] !== b.nums[i])
+      return a.nums[i] > b.nums[i];
+  }
+  return !a.pre && !!b.pre;
+}
+function parseSemver(v) {
+  const m = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$/.exec(v.trim());
+  if (!m)
+    return null;
+  return {
+    nums: [Number(m[1]), Number(m[2]), Number(m[3])],
+    pre: m[4] ?? null
+  };
+}
+
+// src/installer/receipt.ts
+var KINDS = [
+  "statusline",
+  "host-hook",
+  "launch-agent",
+  "macos-pref",
+  "file",
+  "outside-tool",
+  "user-data"
+];
+function receiptPath(env = process.env) {
+  return join5(siltpokeRoot(env), "receipt.json");
+}
+function readReceipt(env = process.env) {
+  const path = receiptPath(env);
+  if (!existsSync4(path))
+    return null;
+  try {
+    const parsed = JSON.parse(readFileSync4(path, "utf8"));
+    return isReceipt(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function addProjectRoot(root, env = process.env) {
+  const receipt = loadForWrite(env);
+  if (receipt.projects.includes(root))
+    return;
+  save(env, { ...receipt, projects: [...receipt.projects, root] });
+}
+function loadForWrite(env) {
+  const path = writablePath(env);
+  const existing = readReceipt(env);
+  if (existing)
+    return existing;
+  if (existsSync4(path)) {
+    try {
+      renameSync2(path, `${path}.corrupt-${Date.now()}`);
+    } catch {}
+  }
+  return { version: 1, entries: [], projects: [] };
+}
+function save(env, receipt) {
+  atomicWrite(writablePath(env), `${JSON.stringify(receipt, null, 2)}
+`);
+}
+function writablePath(env) {
+  const path = receiptPath(env);
+  const realDefault = receiptPath({ HOME: process.env.HOME ?? homedir() });
+  if (false) {}
+  return path;
+}
+function isReceipt(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v))
+    return false;
+  const r = v;
+  return r.version === 1 && Array.isArray(r.entries) && r.entries.every(isEntry) && Array.isArray(r.projects) && r.projects.every((p) => typeof p === "string") && (r.created === undefined || Array.isArray(r.created) && r.created.every((p) => typeof p === "string"));
+}
+function isEntry(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v))
+    return false;
+  const e = v;
+  return typeof e.id === "string" && typeof e.kind === "string" && KINDS.includes(e.kind) && typeof e.target === "string" && typeof e.byUs === "boolean" && (e.state === "pending" || e.state === "done") && typeof e.at === "string" && (e.siltpokeVersion === null || typeof e.siltpokeVersion === "string") && (e.level === "uninstall" || e.level === "purge") && !!e.undo && typeof e.undo === "object" && !Array.isArray(e.undo);
 }
 
 // src/installer/codex-integration.ts
 async function atomicWriteJson(path, data) {
-  await mkdir(dirname2(path), { recursive: true });
+  await mkdir2(dirname4(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}.${Date.now()}.${randomBytes(4).toString("hex")}`;
-  await writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
-  await rename(tmp, path);
+  await writeFile2(tmp, JSON.stringify(data, null, 2), "utf8");
+  await rename2(tmp, path);
 }
 async function readJsonOrEmpty(path) {
-  if (!existsSync(path))
-    return {};
-  try {
-    const parsed = JSON.parse(await readFile3(path, "utf8"));
-    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed) ? parsed : {};
-  } catch {
-    return {};
-  }
+  return readJsonObjectForRewrite(path);
 }
 var LEGACY_COMMAND_MARKERS = [
   "src/hooks/codex-stop.ts",
@@ -238,11 +651,42 @@ async function removeCodexLegacyHooks(hooksPath) {
 }
 
 // src/memory/distil-launcher.ts
-import { basename as basename2, join as join6 } from "path";
+import { basename as basename2, join as join9 } from "path";
+
+// src/utils/process-lock.ts
+import {
+  mkdirSync as mkdirSync2,
+  rmSync as rmSync2,
+  readFileSync as readFileSync5,
+  existsSync as existsSync5,
+  utimesSync
+} from "fs";
+import { join as join7 } from "path";
+function isAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+function isLockHeld(lockPath) {
+  if (!existsSync5(lockPath))
+    return false;
+  const ownerPath = join7(lockPath, "owner.json");
+  if (!existsSync5(ownerPath))
+    return false;
+  try {
+    const owner = JSON.parse(readFileSync5(ownerPath, "utf8"));
+    return isAlive(owner.pid);
+  } catch {
+    return false;
+  }
+}
 
 // src/memory/pending-queue.ts
-import { appendFile, readFile as readFile4, writeFile as writeFile2, rename as rename2, mkdir as mkdir2 } from "fs/promises";
-import { dirname as dirname3, join as join4 } from "path";
+import { appendFile, readFile as readFile4, writeFile as writeFile3, rename as rename3, mkdir as mkdir3 } from "fs/promises";
+import { dirname as dirname5, join as join8 } from "path";
 
 // node_modules/zod/v4/classic/external.js
 var exports_external = {};
@@ -304,7 +748,7 @@ __export(exports_external, {
   pipe: () => pipe,
   partialRecord: () => partialRecord,
   parseAsync: () => parseAsync2,
-  parse: () => parse3,
+  parse: () => parse4,
   overwrite: () => _overwrite,
   optional: () => optional,
   object: () => object,
@@ -506,7 +950,7 @@ __export(exports_core2, {
   process: () => process2,
   prettifyError: () => prettifyError,
   parseAsync: () => parseAsync,
-  parse: () => parse,
+  parse: () => parse2,
   meta: () => meta,
   locales: () => exports_locales,
   isValidJWT: () => isValidJWT,
@@ -1690,7 +2134,7 @@ var _parse = (_Err) => (schema, value, _ctx, _params) => {
   }
   return result.value;
 };
-var parse = /* @__PURE__ */ _parse($ZodRealError);
+var parse2 = /* @__PURE__ */ _parse($ZodRealError);
 var _parseAsync = (_Err) => async (schema, value, _ctx, params) => {
   const ctx = _ctx ? { ..._ctx, async: true } : { async: true };
   let result = schema._zod.run({ value, issues: [] }, ctx);
@@ -4477,10 +4921,10 @@ var $ZodFunction = /* @__PURE__ */ $constructor("$ZodFunction", (inst, def) => {
       throw new Error("implement() must be called with a function");
     }
     return function(...args) {
-      const parsedArgs = inst._def.input ? parse(inst._def.input, args) : args;
+      const parsedArgs = inst._def.input ? parse2(inst._def.input, args) : args;
       const result = Reflect.apply(func, this, parsedArgs);
       if (inst._def.output) {
-        return parse(inst._def.output, result);
+        return parse2(inst._def.output, result);
       }
       return result;
     };
@@ -12702,7 +13146,7 @@ var ZodRealError = /* @__PURE__ */ $constructor("ZodError", initializer2, {
 });
 
 // node_modules/zod/v4/classic/parse.js
-var parse3 = /* @__PURE__ */ _parse(ZodRealError);
+var parse4 = /* @__PURE__ */ _parse(ZodRealError);
 var parseAsync2 = /* @__PURE__ */ _parseAsync(ZodRealError);
 var safeParse2 = /* @__PURE__ */ _safeParse(ZodRealError);
 var safeParseAsync2 = /* @__PURE__ */ _safeParseAsync(ZodRealError);
@@ -12765,7 +13209,7 @@ var ZodType = /* @__PURE__ */ $constructor("ZodType", (inst, def) => {
   inst.def = def;
   inst.type = def.type;
   Object.defineProperty(inst, "_def", { value: def });
-  inst.parse = (data, params) => parse3(inst, data, params, { callee: inst.parse });
+  inst.parse = (data, params) => parse4(inst, data, params, { callee: inst.parse });
   inst.safeParse = (data, params) => safeParse2(inst, data, params);
   inst.parseAsync = async (data, params) => parseAsync2(inst, data, params, { callee: inst.parseAsync });
   inst.safeParseAsync = async (data, params) => safeParseAsync2(inst, data, params);
@@ -14524,7 +14968,7 @@ config(en_default());
 var pendingAnchorSchema = exports_external.object({
   file: exports_external.string().min(1),
   line: exports_external.number().int().positive().optional(),
-  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep"]),
+  tool: exports_external.enum(["tsc", "eslint", "git-diff", "ripgrep", "rubric"]),
   fingerprint: exports_external.string()
 });
 var pendingCritiqueSchema = exports_external.object({
@@ -14541,7 +14985,7 @@ var pendingCritiqueSchema = exports_external.object({
   capture_id: exports_external.string().regex(/^case1-[a-f0-9]+$/).optional()
 });
 function pendingQueuePath(stateBase) {
-  return join4(stateBase, "pending-critiques.jsonl");
+  return join8(stateBase, "pending-critiques.jsonl");
 }
 async function readPending(queuePath) {
   let text;
@@ -14562,37 +15006,6 @@ async function readPending(queuePath) {
   return out;
 }
 
-// src/utils/process-lock.ts
-import {
-  mkdirSync as mkdirSync2,
-  rmSync,
-  readFileSync,
-  existsSync as existsSync2,
-  utimesSync
-} from "fs";
-import { join as join5 } from "path";
-function isAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function isLockHeld(lockPath) {
-  if (!existsSync2(lockPath))
-    return false;
-  const ownerPath = join5(lockPath, "owner.json");
-  if (!existsSync2(ownerPath))
-    return false;
-  try {
-    const owner = JSON.parse(readFileSync(ownerPath, "utf8"));
-    return isAlive(owner.pid);
-  } catch {
-    return false;
-  }
-}
-
 // src/memory/distil-launcher.ts
 function defaultSpawn(argv) {
   const proc = Bun.spawn(argv, {
@@ -14607,15 +15020,15 @@ function defaultSpawn(argv) {
 async function maybeLaunchDistilWorker(homeBase, stateBase, cwd, deps = {}) {
   const spawnFn = deps.spawnFn ?? defaultSpawn;
   const isHeld = deps.isLockHeldFn ?? isLockHeld;
-  const lockPath = deps.lockPath ?? join6(homeBase, "distil-worker.lock");
-  const workerPath = deps.workerPath ?? (basename2(import.meta.dir) === "dist" ? join6(import.meta.dir, "siltpoke-distil.js") : join6(import.meta.dir, "..", "hooks", "on-distil-worker.ts"));
+  const lockPath = deps.lockPath ?? join9(homeBase, "distil-worker.lock");
+  const workerPath = deps.workerPath ?? (basename2(import.meta.dir) === "dist" ? join9(import.meta.dir, "siltpoke-distil.js") : join9(import.meta.dir, "..", "hooks", "on-distil-worker.ts"));
   const entries = await readPending(pendingQueuePath(stateBase));
   if (entries.length === 0)
     return { launched: false, reason: "empty" };
   if (isHeld(lockPath))
     return { launched: false, reason: "locked" };
   try {
-    spawnFn(["bun", workerPath, "--home", homeBase, "--state", stateBase, "--cwd", cwd]);
+    spawnFn([process.execPath, workerPath, "--home", homeBase, "--state", stateBase, "--cwd", cwd]);
     return { launched: true };
   } catch {
     return { launched: false };
@@ -14627,23 +15040,163 @@ function isSiltpokeInternal(env = process.env) {
   return env.SILTPOKE_INTERNAL === "1";
 }
 
+// src/update/session-notice.ts
+import { existsSync as existsSync7, readFileSync as readFileSync6, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3 } from "fs";
+import { dirname as dirname6 } from "path";
+
+// src/config/update-check-config.ts
+import { existsSync as existsSync6 } from "fs";
+import { join as join10 } from "path";
+var updateCheckConfigSchema = exports_external.object({
+  enabled: exports_external.boolean().default(true)
+});
+function loadUpdateCheckConfigSync(home, readFileSyncFn) {
+  const configPath = join10(home, "config.json");
+  if (!existsSync6(configPath))
+    return updateCheckConfigSchema.parse({});
+  try {
+    return parseSection(readFileSyncFn(configPath, "utf8"));
+  } catch {
+    return updateCheckConfigSchema.parse({});
+  }
+}
+function parseSection(raw) {
+  const parsed = JSON.parse(raw);
+  const result = updateCheckConfigSchema.safeParse(parsed.updateCheck ?? {});
+  return result.success ? result.data : updateCheckConfigSchema.parse({});
+}
+
+// src/update/check.ts
+import { join as join11 } from "path";
+var CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+var LATEST_RELEASE_URL = "https://api.github.com/repos/Siltpoke/siltpoke/releases/latest";
+var CACHE_BASENAME = "update-check.json";
+function cachePath(home) {
+  return join11(home, CACHE_BASENAME);
+}
+function parseCache(raw) {
+  try {
+    const o = JSON.parse(raw);
+    if (typeof o.checkedAtMs !== "number" || !Number.isFinite(o.checkedAtMs))
+      return null;
+    return {
+      checkedAtMs: o.checkedAtMs,
+      latestVersion: typeof o.latestVersion === "string" ? o.latestVersion : null,
+      headline: typeof o.headline === "string" ? o.headline : null
+    };
+  } catch {
+    return null;
+  }
+}
+function isStale(cache, nowMs) {
+  if (!cache)
+    return true;
+  const age = nowMs - cache.checkedAtMs;
+  return age < 0 || age >= CHECK_INTERVAL_MS;
+}
+function readReleasePayload(payload) {
+  if (typeof payload !== "object" || payload === null)
+    return null;
+  const o = payload;
+  const tag = typeof o.tag_name === "string" ? o.tag_name.trim() : "";
+  if (!tag)
+    return null;
+  const version2 = tag.replace(/^v/, "");
+  if (!version2)
+    return null;
+  return { latestVersion: version2, headline: firstMeaningfulLines(o.body) };
+}
+function firstMeaningfulLines(body, maxChars = 160) {
+  if (typeof body !== "string")
+    return null;
+  const bullets = [];
+  for (const rawLine of body.split(`
+`)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#") || line.startsWith("---"))
+      continue;
+    const bullet = line.replace(/^[-*]\s+/, "");
+    const clean = bullet.replace(/\*\*/g, "").replace(/`/g, "");
+    if (clean)
+      bullets.push(clean);
+    if (bullets.join(" \xB7 ").length >= maxChars)
+      break;
+  }
+  if (bullets.length === 0)
+    return null;
+  const joined = bullets.join(" \xB7 ");
+  return joined.length <= maxChars ? joined : `${joined.slice(0, maxChars - 1).trimEnd()}\u2026`;
+}
+function updateNotice(installedVersion, cache, updateCommand) {
+  if (!installedVersion || !cache?.latestVersion)
+    return null;
+  if (!isNewerVersion(cache.latestVersion, installedVersion))
+    return null;
+  const head = cache.headline ? ` \u2014 ${cache.headline}` : "";
+  return `siltpoke ${cache.latestVersion} is out (you have ${installedVersion})${head}. ` + `Update with \`${updateCommand}\`, then restart.`;
+}
+
+// src/update/session-notice.ts
+function updateNoticeForSession(deps) {
+  const now = deps.nowMs ?? Date.now;
+  const readF = deps.readFileSyncFn ?? ((p, e) => readFileSync6(p, e));
+  const exists = deps.existsSyncFn ?? existsSync7;
+  try {
+    if (!loadUpdateCheckConfigSync(deps.home, readF).enabled)
+      return SILENT;
+    const path = cachePath(deps.home);
+    const cache = exists(path) ? parseCache(readF(path, "utf8")) : null;
+    return {
+      notice: updateNotice(findInstalledVersion(deps.startDir), cache, deps.updateCommand),
+      needsRefresh: isStale(cache, now())
+    };
+  } catch {
+    return SILENT;
+  }
+}
+var SILENT = { notice: null, needsRefresh: false };
+async function refreshUpdateCache(home, deps = {}) {
+  const now = (deps.nowMs ?? Date.now)();
+  const write = deps.writeFileSyncFn ?? ((p, d) => writeFileSync2(p, d));
+  let entry = { checkedAtMs: now, latestVersion: null, headline: null };
+  try {
+    const f = deps.fetchFn ?? fetch;
+    const res = await f(LATEST_RELEASE_URL, {
+      headers: { accept: "application/vnd.github+json" },
+      signal: AbortSignal.timeout(deps.timeoutMs ?? 5000)
+    });
+    if (res.ok) {
+      const parsed = readReleasePayload(await res.json());
+      if (parsed)
+        entry = { checkedAtMs: now, ...parsed };
+    }
+  } catch {}
+  try {
+    const path = cachePath(home);
+    mkdirSync3(dirname6(path), { recursive: true });
+    write(path, `${JSON.stringify(entry)}
+`);
+  } catch {}
+  return entry;
+}
+
 // src/hooks/session-baseline.ts
 import { createHash } from "crypto";
-import { mkdir as mkdir3, readdir, rm, stat } from "fs/promises";
-import { join as join7 } from "path";
+import { mkdir as mkdir4, readdir, rm as rm2, stat } from "fs/promises";
+import { join as join12 } from "path";
 var BASELINE_RETENTION_DAYS = 7;
 var SAFE_SESSION_ID = /^[A-Za-z0-9_-]{1,128}$/;
 function isSafeSessionId(sessionId) {
   return SAFE_SESSION_ID.test(sessionId);
 }
 function stateDirFor(cwd) {
-  return join7(cwd, ".siltpoke");
+  return join12(cwd, ".siltpoke");
 }
 function legacyBaselinePath(stateDir) {
-  return join7(stateDir, "baseline.json");
+  return join12(stateDir, "baseline.json");
 }
 function sessionBaselineDir(stateDir) {
-  return join7(stateDir, "baselines");
+  return join12(stateDir, "baselines");
 }
 function idDigest(sessionId) {
   return createHash("sha256").update(sessionId).digest("hex").slice(0, 8);
@@ -14651,11 +15204,12 @@ function idDigest(sessionId) {
 function sessionBaselinePath(stateDir, sessionId) {
   if (!isSafeSessionId(sessionId))
     return null;
-  return join7(sessionBaselineDir(stateDir), `${sessionId}-${idDigest(sessionId)}.json`);
+  return join12(sessionBaselineDir(stateDir), `${sessionId}-${idDigest(sessionId)}.json`);
 }
-async function writeSessionBaseline(cwd, baseline) {
+async function writeSessionBaseline(cwd, baseline, env = process.env) {
   const stateDir = stateDirFor(cwd);
-  await mkdir3(stateDir, { recursive: true });
+  await mkdir4(stateDir, { recursive: true });
+  rememberProject(cwd, env);
   const payload = JSON.stringify(baseline, null, 2);
   atomicWrite(legacyBaselinePath(stateDir), payload);
   const perSession = sessionBaselinePath(stateDir, baseline.session_id);
@@ -14663,6 +15217,11 @@ async function writeSessionBaseline(cwd, baseline) {
     return;
   atomicWrite(perSession, payload);
   await pruneSessionBaselines(stateDir).catch(() => 0);
+}
+function rememberProject(cwd, env) {
+  try {
+    addProjectRoot(cwd, env);
+  } catch {}
 }
 async function pruneSessionBaselines(stateDir, now = new Date) {
   const dir = sessionBaselineDir(stateDir);
@@ -14677,10 +15236,10 @@ async function pruneSessionBaselines(stateDir, now = new Date) {
   for (const name of names) {
     if (!name.endsWith(".json") && !name.startsWith(".tmp-"))
       continue;
-    const file2 = join7(dir, name);
+    const file2 = join12(dir, name);
     try {
       if ((await stat(file2)).mtimeMs < cutoff) {
-        await rm(file2, { force: true });
+        await rm2(file2, { force: true });
         removed++;
       }
     } catch {}
@@ -14693,31 +15252,62 @@ async function maybeMigrateLegacyCodexHooks(env) {
   const home = siltpokeRoot(env);
   if (env.SILTPOKE_HOST === "codex") {
     try {
-      const codexMarker = join8(home, ".codex-migrated");
-      if (!existsSync3(codexMarker)) {
+      const codexMarker = join13(home, ".codex-migrated");
+      if (!existsSync8(codexMarker)) {
         await removeCodexLegacyHooks(codexHooksJsonPath(env));
-        await mkdir4(home, { recursive: true });
-        await writeFile3(codexMarker, "");
+        await mkdir5(home, { recursive: true });
+        await writeFile4(codexMarker, "");
       }
     } catch {}
   }
   try {
-    const ccForkMarker = join8(home, ".ccfork-migrated");
-    if (!existsSync3(ccForkMarker)) {
+    const ccForkMarker = join13(home, ".ccfork-migrated");
+    if (!existsSync8(ccForkMarker)) {
       await removeCcForkLegacyHooks(hostSettingsJsonPath(resolveQoderHome(env)));
       await removeCcForkLegacyHooks(hostSettingsJsonPath(resolveCodebuddyHome(env)));
-      await mkdir4(home, { recursive: true });
-      await writeFile3(ccForkMarker, "");
+      await mkdir5(home, { recursive: true });
+      await writeFile4(ccForkMarker, "");
     }
   } catch {}
   try {
-    const agyMarker = join8(home, ".agy-migrated");
-    if (!existsSync3(agyMarker)) {
+    const agyMarker = join13(home, ".agy-migrated");
+    if (!existsSync8(agyMarker)) {
       await removeAgyLegacyHooks(resolveAgyHooksJsonPath(env));
-      await mkdir4(home, { recursive: true });
-      await writeFile3(agyMarker, "");
+      await mkdir5(home, { recursive: true });
+      await writeFile4(agyMarker, "");
     }
   } catch {}
+}
+function updateCommandFor(env) {
+  switch (env.SILTPOKE_HOST) {
+    case "codex":
+      return "codex plugin update siltpoke";
+    case "codebuddy":
+      return "/plugin marketplace update siltpoke";
+    case "qoder":
+      return "qodercli plugin update siltpoke";
+    case "antigravity":
+      return "agy plugin install https://github.com/Siltpoke/siltpoke-agy";
+    default:
+      return "claude plugin update siltpoke";
+  }
+}
+function updateSystemMessage(env) {
+  try {
+    if (isSiltpokeInternal(env))
+      return null;
+    const home = siltpokeRoot(env);
+    const state = updateNoticeForSession({
+      home,
+      startDir: dirname7(fileURLToPath(import.meta.url)),
+      updateCommand: updateCommandFor(env)
+    });
+    if (state.needsRefresh)
+      refreshUpdateCache(home).catch(() => {});
+    return state.notice ? JSON.stringify({ systemMessage: state.notice }) : null;
+  } catch {
+    return null;
+  }
 }
 function codexFirstRunNudge(env) {
   try {
@@ -14726,14 +15316,14 @@ function codexFirstRunNudge(env) {
     if (env.SILTPOKE_HOST !== "codex")
       return null;
     const root = siltpokeRoot(env);
-    if (existsSync3(join8(root, "config.json")))
+    if (existsSync8(join13(root, "config.json")))
       return null;
-    const marker = join8(root, ".codex-nudged");
-    if (existsSync3(marker))
+    const marker = join13(root, ".codex-nudged");
+    if (existsSync8(marker))
       return null;
-    mkdirSync3(root, { recursive: true });
-    writeFileSync2(marker, "");
-    if (!existsSync3(marker))
+    mkdirSync4(root, { recursive: true });
+    writeFileSync3(marker, "");
+    if (!existsSync8(marker))
       return null;
     return JSON.stringify({
       systemMessage: 'Siltpoke is installed but has no pet yet \u2014 say "set up my Siltpoke pet" to create one and start reviews.'
@@ -14758,6 +15348,9 @@ async function handleSessionStart(input) {
   const stateBase = dir;
   await maybeLaunchDistilWorker(homeBase, stateBase, input.cwd).catch(() => {});
   await maybeMigrateLegacyCodexHooks(env).catch(() => {});
+  const rawHome = env.HOME;
+  if (rawHome)
+    await refreshStaleShims(rawHome).catch(() => {});
 }
 if (import.meta.main) {
   try {
@@ -14774,9 +15367,17 @@ if (import.meta.main) {
     if (nudge)
       process.stdout.write(`${nudge}
 `);
+    else {
+      const update = updateSystemMessage(process.env);
+      if (update)
+        process.stdout.write(`${update}
+`);
+    }
   } catch {}
 }
 export {
+  updateSystemMessage,
+  updateCommandFor,
   handleSessionStart,
   codexFirstRunNudge
 };
